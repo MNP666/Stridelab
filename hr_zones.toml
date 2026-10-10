@@ -1,0 +1,39 @@
+# HR zone configuration for interval analysis.
+#
+# Update max_hr to your own value.  A common field estimate is 220 - age,
+# but a max-effort test or recent race is more accurate.
+#
+# Zone boundaries are in bpm.  Zone N spans [min, max).
+# The last zone should have max set high enough to capture any reading.
+
+max_hr = 185   # placeholder — set to your measured maximum HR
+
+[[zones]]
+name  = "Z1 Recovery"
+color = "#aed6f1"   # light blue
+min   = 0
+max   = 111         # < 60 % of 185
+
+[[zones]]
+name  = "Z2 Aerobic"
+color = "#a9dfbf"   # light green
+min   = 111
+max   = 130         # 60–70 %
+
+[[zones]]
+name  = "Z3 Tempo"
+color = "#f9e79f"   # amber
+min   = 130
+max   = 148         # 70–80 %
+
+[[zones]]
+name  = "Z4 Threshold"
+color = "#f0b27a"   # orange
+min   = 148
+max   = 167         # 80–90 %
+
+[[zones]]
+name  = "Z5 VO2max"
+color = "#ec7063"   # red
+min   = 167
+max   = 999         # > 90 %

@@ -222,3 +222,6 @@ __marimo__/
 # Stridelab: activity files and generated output stay local
 data/raw/
 data/derived/
+
+# macOS
+.DS_Store

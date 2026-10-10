@@ -45,7 +45,7 @@ notebooks/      marimo notebooks: interactive exploration, one question per note
 scripts/        non-interactive, repeatable jobs: figures, exports, benchmarks, ginput fallback
 data/raw/       source .fit files, never modified (gitignored); copy from FitTrackz data/raw/
 data/derived/   anything generated: csv / parquet / png (gitignored, safe to delete)
-hr_zones.toml   personal HR zones
+hr_zones.toml   personal HR zones, read by scripts and notebooks (never by the package)
 NOTES.md        dated experiment log: tried → result → decision
 ```
 
@@ -137,7 +137,7 @@ Format is `num name (scale, offset) unit`. ✓ means cross-checked against the s
 
   Records with no speed count as "unknown"; they are not silently dropped.
 - **Intervals:** use laps first (`laps_df()` classified by average speed/HR). Manual `ginput` clicking is only a fallback for unstructured runs.
-- **HR zones** come from `hr_zones.toml` via `tomllib`. Time in zone is the sum of `Δt`, not a row count.
+- **HR zones:** zone functions take the zone boundaries as an argument. Scripts and notebooks load them from `hr_zones.toml` with `tomllib`, and the package never reads the TOML itself. Time in zone is the sum of `Δt`, not a row count.
 - Personal constants (max HR, zones) live in TOML. Experiment parameters are keyword arguments (`--flags` in scripts). No global config, and no positional CLI arguments except the input file.
 
 ## Testing

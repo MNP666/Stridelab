@@ -40,7 +40,7 @@ Stridelab/
 ├── data/
 │   ├── raw/                  .fit files exactly as they came off the watch (not in git)
 │   └── derived/              generated csv / parquet / png (not in git, safe to delete)
-├── hr_zones.toml             personal max HR and zone boundaries
+├── hr_zones.toml             personal max HR and zone boundaries, for scripts and notebooks
 ├── NOTES.md                  dated experiment log: tried → result → decision
 ├── CLAUDE.md                 design rules and FIT format reference
 └── pyproject.toml, uv.lock
