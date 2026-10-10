@@ -2,23 +2,37 @@
 
 One generic decoder and one forward pass. Records, laps, session and scan are all
 views over the messages this yields; never write a second byte walker.
+
+Each definition message is compiled once: a struct.Struct for the bytes, plus one
+converter per field (sentinel -> None, scale/offset, enum name, datetime).
 """
 
+import math
+import re
 import struct
 import warnings as pywarnings
 from collections.abc import Callable, Generator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from os import PathLike
 from pathlib import Path
 from typing import Any
 
-from .profile import BASE_TYPES
+from .profile import BASE_TYPES, ENUMS, MESSAGES, VENDOR_FIELDS, Field
 
 FIT_SIGNATURE = b".FIT"
+FIT_EPOCH = 631_065_600  # 1989-12-31T00:00:00Z as a Unix timestamp
 FIT_STRING, FIT_BYTE = 0x07, 0x0D
+FIT_FLOATS = {0x08, 0x09}
+TIMESTAMP = 253  # field 253 is the timestamp in every message
+FILE_ID, FIELD_DESCRIPTION, DEVELOPER_DATA_ID = 0, 206, 207
+SEMICIRCLES_TO_DEGREES = 180 / 2**31
 
 # How a field's slice of the unpacked struct tuple becomes its value.
 _SCALAR, _ARRAY, _TEXT, _BYTES = range(4)
+
+Warn = Callable[[str], Any]
+Convert = Callable[[Any], Any]
 
 
 class FitParseError(Exception):
@@ -30,6 +44,10 @@ class FitParseError(Exception):
         self.offset = offset
 
 
+class _PastEnd(FitParseError):
+    """A message runs past the end of the data: structural, unless the file is truncated."""
+
+
 @dataclass(slots=True)
 class Message:
     num: int  # global message number
@@ -39,13 +57,38 @@ class Message:
     offset: int  # byte offset of the record header in the source
 
 
+@dataclass(frozen=True, slots=True)
+class DevField:
+    key: tuple[int, int]  # (developer_data_index, field_definition_number)
+    name: str  # field_name as the app wrote it, e.g. "Form Power"
+    column: str  # snake_case key in messages, e.g. "form_power" (dev_ prefix on a name clash)
+    units: str | None
+    base_type: int
+    scale: float | None
+    offset: float | None
+    manufacturer: str | None  # from developer_data_id
+
+
 @dataclass(slots=True)
 class _Definition:
     num: int
-    layout: tuple[tuple[str, int, int], ...]  # (key, kind, number of struct items)
-    dev_layout: tuple[tuple[str, int, int], ...]  # dev fields come after the standard ones
+    name: str
+    slots: tuple[tuple[str, int, int, Convert | None], ...]  # (key, kind, struct items, convert)
+    dev_slots: tuple[tuple[str, int, int, Convert | None], ...]  # dev fields follow standard ones
     n_items: int  # struct items used by the standard fields
     struct: struct.Struct
+    timestamp_item: int | None  # struct item holding field 253, for compressed timestamps
+
+
+@dataclass(slots=True)
+class _Context:
+    """Per-file state that changes how later definitions are compiled."""
+
+    raw: bool
+    warn: Warn
+    manufacturer: str | None = None  # file_id.manufacturer, for VENDOR_FIELDS
+    dev_manufacturers: dict[int, str | None] = field(default_factory=dict)
+    dev: dict[tuple[int, int], DevField] = field(default_factory=dict)
 
 
 def _crc_table() -> tuple[int, ...]:
@@ -69,6 +112,40 @@ def crc16(data: bytes, crc: int = 0) -> int:
     return crc
 
 
+def profile_fields(num: int, manufacturer: str | None) -> tuple[str, dict[int, Field]]:
+    """Message name and fields for `num`, with vendor fields when the manufacturer matches."""
+    name, fields = MESSAGES.get(num, (f"mesg_{num}", {}))
+    vendor = VENDOR_FIELDS.get((manufacturer, num))
+    return name, {**vendor, **fields} if vendor else fields
+
+
+def output_units(f: Field) -> str | None:
+    """Units of the decoded value, which differ from the profile where the reader converts."""
+    if f.type in ("date_time", "local_date_time"):
+        return None
+    return "deg" if f.units == "semicircles" else f.units
+
+
+def dev_field(desc: dict[str, Any], manufacturers: dict[int, str | None]) -> DevField | None:
+    """Build a DevField from a decoded field_description; None if it lacks the key parts."""
+    index, num = desc.get("developer_data_index"), desc.get("field_definition_number")
+    base_type = desc.get("fit_base_type_id")
+    if index is None or num is None or base_type is None:
+        return None
+    name = str(desc.get("field_name") or f"dev_{index}_{num}")
+    column = re.sub(r"\W+", "_", name.lower()).strip("_") or f"dev_{index}_{num}"
+    return DevField(
+        key=(index, num),
+        name=name,
+        column=column,
+        units=desc.get("units"),
+        base_type=base_type,
+        scale=desc.get("scale"),
+        offset=desc.get("offset"),
+        manufacturer=manufacturers.get(index),
+    )
+
+
 def iter_messages(
     source: str | PathLike | bytes,
     *,
@@ -77,61 +154,108 @@ def iter_messages(
 ) -> Iterator[Message]:
     """Yield every data message in file order.
 
-    raw=True: keys are field_<n>, values are raw ints with sentinels kept.
-    Recoverable problems (CRC mismatch, ...) are appended to `warnings` if given,
-    otherwise issued with warnings.warn. Structural problems raise FitParseError.
+    raw=False: FIT profile names, physical values, None for invalid values, enum names,
+    UTC datetimes, developer fields by name. raw=True: field_<n> keys, raw values with
+    sentinels kept, developer fields as bytes under dev_<index>_<num>.
+
+    Recoverable problems (CRC mismatch, truncated file, ...) are appended to `warnings` if
+    given, otherwise issued with warnings.warn. Structural problems raise FitParseError.
     """
-    if not raw:
-        raise NotImplementedError("profile decoding arrives in slice 01 M2; pass raw=True")
     if isinstance(source, (bytes, bytearray, memoryview)):
         buf = bytes(source)
     else:
         buf = Path(source).read_bytes()
     warn = warnings.append if warnings is not None else pywarnings.warn
-    return _walk(buf, warn)
+    return _walk(buf, raw, warn)
 
 
-def _walk(buf: bytes, warn: Callable[[str], Any]) -> Iterator[Message]:
+def _walk(buf: bytes, raw: bool, warn: Warn) -> Iterator[Message]:
     pos = 0
     while pos < len(buf):  # FIT files can be chained back to back
-        pos = yield from _walk_file(buf, pos, warn)
+        pos = yield from _walk_file(buf, pos, _Context(raw, warn))
 
 
-def _walk_file(buf: bytes, start: int, warn: Callable[[str], Any]) -> Generator[Message, None, int]:
-    data_start, data_end = _read_header(buf, start, warn)
-    stored = struct.unpack_from("<H", buf, data_end)[0]
-    computed = crc16(buf[start:data_end])
-    if computed != stored:
-        warn(
-            f"file CRC mismatch: stored {stored:#06x}, computed {computed:#06x} at byte {data_end}"
-        )
+def _walk_file(buf: bytes, start: int, ctx: _Context) -> Generator[Message, None, int]:
+    data_start, data_end, truncated = _read_header(buf, start, ctx.warn)
+    if not truncated:
+        stored = struct.unpack_from("<H", buf, data_end)[0]
+        computed = crc16(buf[start:data_end])
+        if computed != stored:
+            ctx.warn(
+                f"file CRC mismatch: stored {stored:#06x}, computed {computed:#06x} "
+                f"at byte {data_end}"
+            )
 
     defs: dict[int, _Definition] = {}
+    last_timestamp: int | None = None  # raw field 253 of the latest message, any type
     pos = data_start
-    while pos < data_end:
-        header = buf[pos]
-        if header & 0x80:
-            raise FitParseError("compressed timestamp header not supported yet", pos)
-        local = header & 0x0F
-        if header & 0x40:
-            defs[local], pos = _read_definition(buf, pos, data_end, warn)
-            continue
-        d = defs.get(local)
-        if d is None:
-            raise FitParseError(f"data message for undefined local type {local}", pos)
-        end = pos + 1 + d.struct.size
-        if end > data_end:
-            raise FitParseError("data message runs past end of data", pos)
-        values = d.struct.unpack_from(buf, pos + 1)
-        fields = _fields(d.layout, values)
-        dev_fields = _fields(d.dev_layout, values, d.n_items) if d.dev_layout else {}
-        yield Message(d.num, f"mesg_{d.num}", fields, dev_fields, pos)
-        pos = end
-    return data_end + 2
+    try:
+        while pos < data_end:
+            header = buf[pos]
+            compressed_timestamp = None
+            if header & 0x80:  # compressed timestamp header: local type in bits 5-6
+                local = (header >> 5) & 0x03
+                if last_timestamp is None:
+                    raise FitParseError("compressed timestamp before any full timestamp", pos)
+                last_timestamp += ((header & 0x1F) - last_timestamp) & 0x1F
+                compressed_timestamp = last_timestamp
+            elif header & 0x40:
+                defs[header & 0x0F], pos = _read_definition(buf, pos, data_end, ctx)
+                continue
+            else:
+                local = header & 0x0F
+
+            d = defs.get(local)
+            if d is None:
+                raise FitParseError(f"data message for undefined local type {local}", pos)
+            end = pos + 1 + d.struct.size
+            if end > data_end:
+                raise _PastEnd("data message runs past end of data", pos)
+            values = d.struct.unpack_from(buf, pos + 1)
+
+            if d.timestamp_item is not None and values[d.timestamp_item] != 0xFFFFFFFF:
+                last_timestamp = values[d.timestamp_item]
+            fields = _fields(d.slots, values)
+            if compressed_timestamp is not None:  # an explicit field 253 would win
+                key, value = (
+                    ("field_253", compressed_timestamp)
+                    if ctx.raw
+                    else ("timestamp", _datetime(compressed_timestamp))
+                )
+                fields = {key: value} | fields
+            dev_fields = _fields(d.dev_slots, values, d.n_items) if d.dev_slots else {}
+            message = Message(d.num, d.name, fields, dev_fields, pos)
+            if not ctx.raw:
+                _remember(message, ctx)
+            yield message
+            pos = end
+    except _PastEnd as e:
+        if not truncated:
+            raise
+        ctx.warn(f"file truncated: incomplete message at byte {e.offset}, decoding stopped")
+        return len(buf)
+    return len(buf) if truncated else data_end + 2
 
 
-def _read_header(buf: bytes, start: int, warn: Callable[[str], Any]) -> tuple[int, int]:
-    """Validate the file header at `start`; return the data range [data_start, data_end)."""
+def _remember(message: Message, ctx: _Context) -> None:
+    """Keep what later definitions need: the manufacturer and the developer field types."""
+    if message.num == FILE_ID:
+        ctx.manufacturer = message.fields.get("manufacturer")
+    elif message.num == DEVELOPER_DATA_ID:
+        index = message.fields.get("developer_data_index")
+        ctx.dev_manufacturers[index] = message.fields.get("manufacturer_id")
+    elif message.num == FIELD_DESCRIPTION:
+        dev = dev_field(message.fields, ctx.dev_manufacturers)
+        if dev is None:
+            ctx.warn(
+                f"field_description without index, number or base type at byte {message.offset}"
+            )
+        else:
+            ctx.dev[dev.key] = dev
+
+
+def _read_header(buf: bytes, start: int, warn: Warn) -> tuple[int, int, bool]:
+    """Validate the file header at `start`; return (data_start, data_end, truncated)."""
     size = buf[start]
     if size not in (12, 14):
         raise FitParseError(f"unsupported file header size {size}", start)
@@ -147,21 +271,18 @@ def _read_header(buf: bytes, start: int, warn: Callable[[str], Any]) -> tuple[in
     data_start = start + size
     data_end = data_start + data_size
     if data_end + 2 > len(buf):
-        # Slice 01 M6: warn and keep what can be decoded instead of raising.
-        raise FitParseError(
+        warn(
             f"file truncated: header promises {data_size} data bytes + CRC, "
-            f"{len(buf) - data_start} bytes present",
-            len(buf),
+            f"{len(buf) - data_start} bytes present, CRC not checked, at byte {len(buf)}"
         )
-    return data_start, data_end
+        return data_start, min(data_end, len(buf)), True
+    return data_start, data_end, False
 
 
-def _read_definition(
-    buf: bytes, pos: int, data_end: int, warn: Callable[[str], Any]
-) -> tuple[_Definition, int]:
-    """Compile the definition message at `pos` into one struct.Struct; return it and the next position."""
+def _read_definition(buf: bytes, pos: int, data_end: int, ctx: _Context) -> tuple[_Definition, int]:
+    """Compile the definition message at `pos`; return it and the next position."""
     if pos + 6 > data_end:
-        raise FitParseError("definition message runs past end of data", pos)
+        raise _PastEnd("definition message runs past end of data", pos)
     arch = buf[pos + 2]
     if arch not in (0, 1):
         raise FitParseError(f"unknown architecture byte {arch}", pos + 2)
@@ -169,62 +290,156 @@ def _read_definition(
     num = struct.unpack_from(endian + "H", buf, pos + 3)[0]
     end = pos + 6 + 3 * buf[pos + 5]
     if end > data_end:
-        raise FitParseError("definition message runs past end of data", pos)
+        raise _PastEnd("definition message runs past end of data", pos)
 
-    codes, layout = [endian], []
+    if ctx.raw:
+        name, profile = f"mesg_{num}", {}
+    else:
+        name, profile = profile_fields(num, ctx.manufacturer)
+    codes, slots, item, timestamp_item = [endian], [], 0, None
     for i in range(pos + 6, end, 3):
         field_num, size, base_type = buf[i], buf[i + 1], buf[i + 2]
-        bt = BASE_TYPES.get(base_type & 0x1F)
-        if bt is None:
-            warn(
-                f"unknown base type {base_type:#04x} for field {field_num} of message {num}, kept as bytes, at byte {i}"
-            )
-            code, kind, n = f"{size}s", _BYTES, 1
-        elif base_type & 0x1F == FIT_STRING:
-            code, kind, n = f"{size}s", _TEXT, 1
-        elif base_type & 0x1F == FIT_BYTE or size % bt.size:
-            code, kind, n = f"{size}s", _BYTES, 1
-        elif size == bt.size:
-            code, kind, n = bt.code, _SCALAR, 1
-        else:
-            n = size // bt.size
-            code, kind = f"{n}{bt.code}", _ARRAY
+        f = profile.get(field_num)
+        code, kind, n = _layout(size, base_type, ctx.warn, f"field {field_num} of message {num}", i)
+        if field_num == TIMESTAMP and kind == _SCALAR:
+            timestamp_item = item
+        key = f.name if f else f"field_{field_num}"
         codes.append(code)
-        layout.append((f"field_{field_num}", kind, n))
+        slots.append((key, kind, n, None if ctx.raw else _converter(base_type, kind, f)))
+        item += n
 
-    # Developer fields: (field_num, size, developer_data_index). Their types live in
-    # field_description messages; until those are applied (slice 01 M3) keep raw bytes.
-    dev_layout = []
+    # Developer fields: (field_num, size, developer_data_index), typed by an earlier
+    # field_description. Without one (or in raw mode) they stay bytes under dev_<index>_<num>.
+    dev_slots = []
     if buf[pos] & 0x20:
         if end + 1 > data_end:
-            raise FitParseError("definition message runs past end of data", pos)
+            raise _PastEnd("definition message runs past end of data", pos)
         dev_start, end = end + 1, end + 1 + 3 * buf[end]
         if end > data_end:
-            raise FitParseError("definition message runs past end of data", pos)
+            raise _PastEnd("definition message runs past end of data", pos)
+        standard_names = {f.name for f in profile.values()}
         for i in range(dev_start, end, 3):
-            field_num, size, dev_index = buf[i], buf[i + 1], buf[i + 2]
-            codes.append(f"{size}s")
-            dev_layout.append((f"dev_{dev_index}_{field_num}", _BYTES, 1))
+            field_num, size, index = buf[i], buf[i + 1], buf[i + 2]
+            dev = None if ctx.raw else ctx.dev.get((index, field_num))
+            if dev is None:
+                if not ctx.raw:
+                    ctx.warn(
+                        f"developer field {index}/{field_num} has no field_description, kept as bytes, at byte {i}"
+                    )
+                codes.append(f"{size}s")
+                dev_slots.append((f"dev_{index}_{field_num}", _BYTES, 1, None))
+                continue
+            where = f"developer field {dev.name!r}"
+            code, kind, n = _layout(size, dev.base_type, ctx.warn, where, i)
+            key = f"dev_{dev.column}" if dev.column in standard_names else dev.column
+            bt = BASE_TYPES.get(dev.base_type & 0x1F)
+            f = Field(key, bt.name if bt else "byte", dev.scale or 1, dev.offset or 0, dev.units)
+            codes.append(code)
+            dev_slots.append((key, kind, n, _converter(dev.base_type, kind, f)))
 
-    n_items = sum(n for _, _, n in layout)
     definition = _Definition(
-        num, tuple(layout), tuple(dev_layout), n_items, struct.Struct("".join(codes))
+        num,
+        name,
+        tuple(slots),
+        tuple(dev_slots),
+        item,
+        struct.Struct("".join(codes)),
+        timestamp_item,
     )
     return definition, end
 
 
-def _fields(
-    layout: tuple[tuple[str, int, int], ...], values: tuple, start: int = 0
-) -> dict[str, Any]:
+def _layout(size: int, base_type: int, warn: Warn, where: str, offset: int) -> tuple[str, int, int]:
+    """struct code, kind and number of struct items for one field."""
+    base = base_type & 0x1F
+    bt = BASE_TYPES.get(base)
+    if bt is None:
+        warn(f"unknown base type {base_type:#04x} for {where}, kept as bytes, at byte {offset}")
+        return f"{size}s", _BYTES, 1
+    if base == FIT_STRING:
+        return f"{size}s", _TEXT, 1
+    if base == FIT_BYTE or size % bt.size:
+        return f"{size}s", _BYTES, 1
+    if size == bt.size:
+        return bt.code, _SCALAR, 1
+    n = size // bt.size
+    return f"{n}{bt.code}", _ARRAY, n
+
+
+def _converter(base_type: int, kind: int, f: Field | None) -> Convert | None:
+    """raw value -> decoded value: sentinel -> None, then scale/offset, enum or datetime."""
+    base = base_type & 0x1F
+    if kind == _TEXT:
+        return _empty_to_none
+    if kind == _BYTES:
+        return _all_ff_to_none if base == FIT_BYTE else None
+    invalid = BASE_TYPES[base].invalid
+    value = _value_converter(f)
+
+    if base in FIT_FLOATS:  # the all-ones sentinel is a NaN, which never compares equal
+
+        def one(v):
+            return None if math.isnan(v) else value(v) if value else v
+    else:
+
+        def one(v):
+            return None if v == invalid else value(v) if value else v
+
+    if kind == _ARRAY:
+
+        def many(vs):
+            out = tuple(one(v) for v in vs)
+            return None if all(v is None for v in out) else out
+
+        return many
+    return one
+
+
+def _value_converter(f: Field | None) -> Convert | None:
+    if f is None:
+        return None
+    if f.type in ("date_time", "local_date_time"):
+        return _datetime
+    if f.type in ENUMS:
+        names, prefix = ENUMS[f.type], f.type
+        return lambda v: names.get(v, f"{prefix}_{v}")
+    if f.units == "semicircles":
+        return _degrees
+    if f.scale != 1 or f.offset != 0:
+        scale, offset = f.scale, f.offset
+        return lambda v: v / scale - offset
+    return None
+
+
+def _datetime(v: int) -> datetime:
+    # local_date_time goes through here too: wall-clock time labelled UTC, so that
+    # activity.local_timestamp - activity.timestamp is the UTC offset.
+    return datetime.fromtimestamp(v + FIT_EPOCH, tz=UTC)
+
+
+def _degrees(v: int) -> float:
+    return v * SEMICIRCLES_TO_DEGREES
+
+
+def _empty_to_none(v: str | bytes) -> str | bytes | None:
+    return v or None
+
+
+def _all_ff_to_none(v: bytes) -> bytes | None:
+    return v if v.strip(b"\xff") else None
+
+
+def _fields(slots: tuple, values: tuple, start: int = 0) -> dict[str, Any]:
     fields = {}
     i = start
-    for key, kind, n in layout:
+    for key, kind, n, convert in slots:
         if kind == _ARRAY:
-            fields[key] = values[i : i + n]
+            v = values[i : i + n]
         elif kind == _TEXT:
-            fields[key] = _text(values[i])
+            v = _text(values[i])
         else:
-            fields[key] = values[i]
+            v = values[i]
+        fields[key] = convert(v) if convert else v
         i += n
     return fields
 

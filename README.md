@@ -4,7 +4,7 @@ Explore running data from `.fit` files. Stridelab has its own pure-Python FIT de
 
 It replaces FitTrackz, the earlier Rust attempt. The design rules, FIT format notes and lessons learned are in [CLAUDE.md](CLAUDE.md).
 
-> **Status:** early. The decoder is being written, so some commands below describe the intended setup.
+> **Status:** the decoder and the `Activity` API work (slice 01, see [docs/slice01.md](docs/slice01.md)). Smoothing and segmentation come next; the layout below still lists some files that don't exist yet.
 
 ## Quick start
 
@@ -13,7 +13,15 @@ uv sync                                          # creates .venv and installs ev
 mkdir -p data/raw data/derived
 cp ../FitTrackz/data/raw/*.fit data/raw/         # sample files are not in git
 uv run python -m stridelab data/raw/long_run.fit # one-screen summary
-uv run marimo edit notebooks/first_look.py       # opens the notebook, or creates it
+uv run marimo edit notebooks/first_look.py       # summary, dev fields, channel plots, a first polars cell
+```
+
+```python
+import stridelab as sl
+
+act = sl.read("data/raw/long_run.fit")   # ~50 ms for a 3-hour run
+act.summary()                            # device, sport, start, distance_m, timer_time_s, avg HR, ...
+df = act.records_df()                    # pandas: UTC DatetimeIndex, form_power, step_length, ..., elapsed_s
 ```
 
 ## Layout
@@ -27,9 +35,9 @@ Stridelab/
 │   ├── smoothing.py          Series → Series smoothers (sma, ema, …)
 │   ├── segments.py           moving/stopped segments, laps → intervals, HR zones
 │   └── __main__.py           python -m stridelab FILE [--scan | --csv]
-├── tests/                    pytest: synthetic FIT writer + golden tests on data/raw/
+├── tests/                    pytest: synthetic FIT writer, golden tests on data/raw/, SDK cross-check
 ├── notebooks/                marimo notebooks, one question each, e.g.
-│   ├── first_look.py         every channel of one run, raw vs smoothed
+│   ├── first_look.py         summary, dev fields and the main channels of one run
 │   ├── smoother_comparison.py
 │   ├── intervals.py          reps from laps: pace, HR recovery, dynamics per rep
 │   └── pandas_vs_polars.py   the same analysis in both, to learn polars
@@ -95,7 +103,7 @@ uv add <pkg>                                       # dependency the package need
 uv add --dev <pkg>                                 # notebooks, scripts, tests only
 ```
 
-The package depends only on numpy, pandas and matplotlib. polars, marimo, pytest and ruff are dev dependencies and are never imported from `src/`. FIT decoding is always our own code: no `fitparse`, `fitdecode` or Garmin SDK at runtime.
+The package depends only on numpy, pandas and matplotlib. polars, marimo, pytest, ruff and garmin-fit-sdk are dev dependencies and are never imported from `src/`. FIT decoding is always our own code: no `fitparse`, `fitdecode` or Garmin SDK at runtime. The Garmin SDK is only an oracle in `tests/test_oracle.py`, which checks our profile tables and every decoded value against it.
 
 ## License
 

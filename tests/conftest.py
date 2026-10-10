@@ -5,7 +5,7 @@ import pytest
 DATA = Path(__file__).resolve().parents[1] / "data" / "raw"
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def fit_file():
     """Return a function name -> data/raw/<name>.fit that skips the test if the file is missing."""
 

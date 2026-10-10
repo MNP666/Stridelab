@@ -40,7 +40,7 @@ src/stridelab/
   segments.py   L3  moving/stopped detection, segment ids, laps → intervals, HR zones
   __main__.py       tiny CLI: summary | --scan | --csv
 tests/          fitwriter.py (synthetic FIT encoder), conftest.py (data paths, skip if missing)
-                + test_reader / test_activity / test_smoothing
+                + test_reader / test_activity / test_oracle (vs garmin-fit-sdk) / test_smoothing
 notebooks/      marimo notebooks: interactive exploration, one question per notebook
 scripts/        non-interactive, repeatable jobs: figures, exports, benchmarks, ginput fallback
 data/raw/       source .fit files, never modified (gitignored); copy from FitTrackz data/raw/
@@ -57,18 +57,20 @@ NOTES.md        dated experiment log: tried → result → decision
 
 ```python
 import stridelab as sl
-act = sl.read("data/raw/long_run.fit")   # path or bytes; strict=True, raw=False
-act.summary()                            # flat dict: device, sport, start, distance, timer time, HR, ...
-act.file_id, act.session, act.device_info     # dict[str, Any] with FIT profile names (act.sessions if >1)
+act = sl.read("data/raw/long_run.fit")   # path or bytes; raw=False (a strict= flag is not built yet)
+act.summary()                            # flat dict: device, sport, start, distance_m, timer_time_s, HR, ...
+act.file_id, act.session, act.device_info     # dict[str, Any] with FIT profile names (act.sessions: all)
 act.records, act.laps, act.events        # list[dict]; dev fields merged in
+act.select(23)                           # any message type by global number, as list[dict]
 act.dev_fields                           # [DevField(key, name, column, units, base_type, scale, offset, manufacturer)]
 act.units                                # {"step_length": "mm", "form_power": "Watts", ...}
 act.messages                             # every Message in file order (escape hatch)
 act.warnings                             # list[str]
-act.field_stats("record")                # count / none / zeros / min / max / samples per field (replaces scan + dump)
+act.field_stats("record")                # (slice 02) count / none / zeros / min / max / samples per field
 df = act.records_df()                    # UTC DatetimeIndex, one column per field, + elapsed_s; df.attrs["units"]
 laps = act.laps_df()
-sl.read(path, raw=True)                  # no profile: field_<n> keys, raw ints, sentinels kept
+sl.read(path, raw=True)                  # no profile: field_<n> keys, raw ints, sentinels kept, dev fields as bytes
+sl.iter_messages(path, warnings=[])      # the Message stream itself; without a list, warnings go to warnings.warn
 ```
 
 - **pandas is the package's DataFrame library.** All `*_df()` methods and L3 functions take and return pandas, so there is only one dialect in `src/`. Polars is for learning in notebooks: build frames straight from the dicts with `pl.DataFrame(act.records, infer_schema_length=None)`. Without that argument, a column that is None for the first 100 rows (paused GPS, late dev fields) makes construction fail. `pl.from_pandas` needs pyarrow for tz-aware and string columns, and pyarrow is not installed. Doing the same analysis in both dialects in one notebook is encouraged, and is a good check.
@@ -108,7 +110,7 @@ sl.read(path, raw=True)                  # no profile: field_<n> keys, raw ints,
 
 ## Profile subset to start with
 
-Format is `num name (scale, offset) unit`. ✓ means cross-checked against the sample files. Check anything new against Profile.xlsx.
+Format is `num name (scale, offset) unit`. ✓ means cross-checked against the sample files. `profile.py` holds this subset plus every field the sample files contain. Its entries were generated from `garmin-fit-sdk`, and `tests/test_oracle.py` checks them, and every decoded value, against it. Add new entries the same way, never by hand from memory.
 
 - **record 20:** 253 timestamp ✓ · 0/1 position_lat/long (semicircles) ✓ · 2 altitude (5, 500) m ✓ · 3 heart_rate bpm ✓ · 4 cadence rpm (running: one foot, so steps/min = 2 ×) ✓ · 5 distance (100) m ✓ · 6 speed (1000) m/s ✓ · 7 power W ✓ · 29 accumulated_power W · 39 vertical_oscillation (10) mm ✓ · 41 stance_time (10) ms ✓ · 42 activity_type · 53 fractional_cadence (128) rpm · 73 enhanced_speed (1000) m/s · 78 enhanced_altitude (5, 500) m · **83 vertical_ratio (100) %** ✓ · **85 step_length (10) mm** ✓
 - **session 18:** 253 timestamp · 2 start_time · 5 sport · 6 sub_sport · 7 total_elapsed_time (1000) s · 8 total_timer_time (1000) s · 9 total_distance (100) m · 10 total_cycles · 11 total_calories kcal · 14/15 avg/max_speed (1000) m/s · 16/17 avg/max_heart_rate · 18/19 avg/max_cadence · 20/21 avg/max_power · 22/23 total_ascent/descent m · 35 training_stress_score (10)
@@ -122,8 +124,8 @@ Format is `num name (scale, offset) unit`. ✓ means cross-checked against the s
 - **Enums** (subset; an unknown value becomes the string `"<enum>_<n>"`):
   - manufacturer: 1 garmin, 23 suunto, 32 wahoo_fitness, 95 stryd, 123 polar_electro, 255 development, 294 coros
   - sport: 0 generic, 1 running, 2 cycling, 5 swimming, 10 training, 11 walking, 17 hiking
-  - sub_sport: 0 generic, 1 treadmill, 2 street, 3 trail, 4 track
-- **`VENDOR_FIELDS`** are applied only when `file_id.manufacturer` matches. Example: Coros (294) session field 91 is a TSS/training-load value (÷10, name unverified). Vendor quirks live here and never in the decoder.
+  - sub_sport: 0 generic, 1 treadmill, 2 street, 3 trail, 4 track, 45 indoor_running
+- **`VENDOR_FIELDS`**, keyed by `(manufacturer name, mesg_num)`, are applied only when `file_id.manufacturer` matches. Vendor quirks live here and never in the decoder. The table is empty: the old example, Coros session field 91 as "training load", is the standard `avg_stance_time` (scale 10, ms; see "Lessons").
 
 ## Analysis layer (pandas/numpy)
 
@@ -145,7 +147,7 @@ Format is `num name (scale, offset) unit`. ✓ means cross-checked against the s
 - `tests/fitwriter.py` is a minimal FIT *encoder*: header, definitions, data, dev fields, compressed headers, big-endian, CRC. Every reader feature gets a synthetic test. The sample files contain **no compressed timestamps** and are all little-endian, so those code paths are untested otherwise.
 - Golden tests use `data/raw/*.fit` (skipped if absent). The values below were verified with an independent decoder.
 - Port the Rust smoother tests: a flat signal stays unchanged, length and index are preserved, and `ema(alpha=1)` is the identity.
-- Optional oracle: Garmin's official `garmin-fit-sdk` in the dev group (`uv add --dev garmin-fit-sdk`), imported only by tests to cross-check decoded values and profile scales. It checks our decoder and never replaces it, so `src/` never imports it.
+- **Oracle:** Garmin's official `garmin-fit-sdk` is in the dev group and imported only by `tests/test_oracle.py`. That test checks profile entries, enum codes and every decoded value of the sample files against the SDK. It checks our decoder and never replaces it, so `src/` never imports it. The test lists the places where we deliberately differ from the SDK (dev-field sentinels, `local_date_time`, ...).
 
 ## Sample-file facts
 
@@ -155,11 +157,19 @@ All three files come from a Coros PACE Pro, are little-endian, have valid CRCs a
 |---|---|---|---|---|---|---|
 | long_run.fit | 533,216 | 9,825 | 31 | 10 | 1 | Form Power, Leg Spring Stiffness, Air Power, Impact Loading Rate (sint32), Effort Pace |
 | intervals_example.fit | 137,457 | 3,237 | 15 | 6 | 1 | Effort Pace only (no Stryd fields) |
-| treadmill.fit | 129,644 | 3,558 | 18 | 4 | 1 | Form Power, Leg Spring Stiffness, Impact Loading Rate; no GPS, no step_length; sub_sport 45 |
+| treadmill.fit | 129,644 | 3,558 | 18 | 4 | 1 | Form Power, Leg Spring Stiffness, Impact Loading Rate; no GPS, no step_length; sub_sport 45 (indoor_running) |
 
 - **long_run session:** total_distance 30385.53 m, total_timer_time 9823.74 s, total_elapsed_time 10151.56 s, avg/max HR 143/162, avg/max speed 3.093/3.846, calories 2330, ascent/descent 218/226, avg_power 252, avg_cadence 91. Manufacturer is 294, product_name is "COROS PACE Pro". There are 4 record gaps longer than 1 s (max 139 s), matching the timer stop/start events.
 - **Physics checks:** `vertical_ratio ≈ 100 · vertical_oscillation / step_length` (median difference 0.1 percentage points). `step_length ≈ speed / (2 · cadence / 60)` (1020 vs 1022 mm).
-- **intervals_example laps:** laps 4, 6, 8, 10 and 12 are the 1000 m reps (~4.2 m/s); laps 5, 7, 9 and 11 are the ~150 s rests.
+- **intervals_example laps:** laps 4, 6, 8, 10 and 12 are the 1000 m reps (~4.2 m/s); laps 5, 7, 9 and 11 are the ~150 s rests. Lap n is `message_index` n − 1.
+- **Coros quirks:**
+  - one `device_info` per file, without `device_index`
+  - `activity.total_timer_time` holds the *elapsed* time
+  - `event.data` (uint32) is written in 1 byte, so it decodes as bytes
+  - the dev-field descriptions carry no scale or offset
+  - Effort Pace is described twice
+  - local time is UTC+1
+  - the first record after each timer restart has 0 for speed, cadence, step_length and form_power
 
 ## Lessons from the Rust version (don't reintroduce)
 
@@ -171,11 +181,12 @@ All three files come from a Coros PACE Pro, are little-endian, have valid CRCs a
 - Smoothing windows were point-based, and missing values were compacted out before smoothing. Use time-based, NaN-preserving windows.
 - Parsing, smoothing and the CSV format were coupled behind a `cargo run` subprocess that ran once per variant. Parse once, then experiment in-process.
 - Hand-written enum tables had wrong codes: Coros was listed as 263, but the files say 294. Copy codes from Profile.xlsx.
+- Coros session field 91 was reported as a "training_stress_score" of 236.0. The SDK profile says it is `avg_stance_time` (236.0 ms), and the mean record stance_time is 236.3 ms. That is rule 6 again: a meaning guessed from a value range.
 
 ## Open questions (log outcomes in NOTES.md)
 
 - **Stop detection:** speed threshold, timer events, or both? How long a debounce?
-- Should 0 be treated as missing in running dynamics (stance_time, vertical_oscillation, ...)?
+- Should 0 be treated as missing in running dynamics (stance_time, vertical_oscillation, ...)? Every timer restart in long_run begins with a record of zeros.
 - **Smoother comparison at equal effective lag:** SMA vs EMA vs Savitzky–Golay (`scipy.signal.savgol_filter`) vs Kalman.
 - Are laps enough to define intervals, or do structured workouts also need `workout_step` (27)?
-- **Is a compiled core still needed?** A naive pure-Python walk of long_run.fit takes about 0.12 s. Revisit PyO3/Rust only if a full decode of the largest file exceeds about 1 s.
+- ~~**Is a compiled core still needed?**~~ No. A full decode of long_run.fit takes 54 ms, and `records_df()` another 17 ms (NOTES.md, 2026-10-10). Revisit PyO3/Rust only if a full decode of the largest file exceeds about 1 s.

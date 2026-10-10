@@ -85,8 +85,16 @@ class FitWriter:
     def data(self, local: int, *values):
         """Values in definition order, dev fields last: int/float, tuple for arrays,
         str for strings, bytes as-is."""
+        return self._message(local, local, values)
+
+    def compressed(self, local: int, time_offset: int, *values):
+        """A data message with a compressed timestamp header (local type 0-3, offset 0-31)."""
+        assert 0 <= local <= 3 and 0 <= time_offset <= 31
+        return self._message(local, 0x80 | local << 5 | time_offset, values)
+
+    def _message(self, local: int, header: int, values: tuple):
         endian, fields = self._defs[local]
-        self._data.append(local)
+        self._data.append(header)
         for (_, typ, size), value in zip(fields, values, strict=True):
             self._data += _encode(endian, typ, size, value)
         return self

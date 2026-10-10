@@ -12,6 +12,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "garmin-fit-sdk>=21.218.0",
     "marimo>=0.25.1",
     "polars>=2.0.0",
     "pytest>=9.1.1",
@@ -28,3 +29,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 extend-exclude = ["*.md"]  # docs keep their hand-aligned code comments
+
+[tool.ruff.lint.per-file-ignores]
+# marimo: a cell displays its last bare expression and always ends with a return
+"notebooks/*" = ["B018", "PLR1711"]
