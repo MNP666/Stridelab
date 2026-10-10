@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Stridelab: activity files and generated output stay local
+data/raw/
+data/derived/
