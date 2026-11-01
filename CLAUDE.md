@@ -67,8 +67,8 @@ act.units                                # {"step_length": "mm", "form_power": "
 act.messages                             # every Message in file order (escape hatch)
 act.warnings                             # list[str]
 act.field_stats("record")                # (slice 02) count / none / zeros / min / max / samples per field
-df = act.records_df()                    # UTC DatetimeIndex, one column per field, + elapsed_s; df.attrs["units"]
-laps = act.laps_df()
+df = act.records_df()                    # UTC DatetimeIndex, one column per field, + elapsed_s, lap_index; df.attrs["units"]
+laps = act.laps_df()                     # df.join(laps.set_index("message_index"), on="lap_index", rsuffix="_lap")
 sl.read(path, raw=True)                  # no profile: field_<n> keys, raw ints, sentinels kept, dev fields as bytes
 sl.iter_messages(path, warnings=[])      # the Message stream itself; without a list, warnings go to warnings.warn
 ```
