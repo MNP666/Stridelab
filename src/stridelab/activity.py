@@ -164,10 +164,13 @@ class Activity:
         }
 
     def records_df(self) -> pd.DataFrame:
-        """One row per record: UTC DatetimeIndex, one column per field, plus elapsed_s.
+        """One row per record: UTC DatetimeIndex, one column per field, plus elapsed_s and lap_index.
 
         speed/altitude are filled from enhanced_speed/enhanced_altitude (which win).
         elapsed_s is wall-clock seconds since the first record, so pauses are included.
+        lap_index is the message_index of the record's lap (see _lap_index), so
+        df.join(act.laps_df().set_index("message_index"), on="lap_index", rsuffix="_lap")
+        puts lap values next to every record.
         """
         self._need_profile("records_df()")
         df = pd.DataFrame(self.records)
@@ -178,8 +181,30 @@ class Activity:
         if "timestamp" in df:
             df = df.set_index(pd.DatetimeIndex(df.pop("timestamp"), name="timestamp"))
             df["elapsed_s"] = (df.index - df.index[0]).total_seconds()
+            df["lap_index"] = self._lap_index(df.index)
         df.attrs["units"] = self._units_for(df) | ({"elapsed_s": "s"} if "elapsed_s" in df else {})
         return df
+
+    def _lap_index(self, times: pd.DatetimeIndex) -> pd.api.extensions.ExtensionArray:
+        """message_index of the lap each time falls in: start_time <= t < next lap's start,
+        and t <= the lap's own end (its timestamp). <NA> outside every lap.
+
+        Laps tile the timeline (each lap ends when the next starts), so a record on a
+        boundary belongs to the lap that is starting.
+        """
+        out = pd.array([None] * len(times), dtype="Int64")
+        laps = pd.DataFrame(self.laps)
+        if laps.empty or not {"start_time", "timestamp"} <= set(laps.columns):
+            return out
+        if "message_index" not in laps:
+            laps["message_index"] = range(len(laps))
+        laps = laps.dropna(subset=["start_time", "timestamp"]).sort_values("start_time")
+        starts = pd.DatetimeIndex(laps["start_time"])
+        ends = pd.DatetimeIndex(laps["timestamp"])
+        i = starts.searchsorted(times, side="right") - 1  # last lap started at or before t
+        inside = (i >= 0) & (times <= ends[i.clip(0)])
+        out[inside] = laps["message_index"].to_numpy()[i[inside]]
+        return out
 
     def laps_df(self) -> pd.DataFrame:
         """One row per lap, in message_index order."""

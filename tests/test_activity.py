@@ -108,6 +108,21 @@ def test_golden_interval_laps(fit_file):
     assert ((rests["total_timer_time"] - 150).abs() < 5).all()
 
 
+def test_golden_lap_index(fit_file):
+    act = sl.read(fit_file("intervals_example"))
+    df, laps = act.records_df(), act.laps_df()
+    assigned = df["lap_index"].dropna()
+    assert assigned.is_monotonic_increasing and set(assigned) == set(range(15))
+    # The last record is 1 s after the last lap ends, so it lies outside every lap
+    assert df["lap_index"].isna().sum() == 1 and pd.isna(df["lap_index"].iloc[-1])
+    # Records are 1 Hz: a lap without a pause holds one record per second of the lap
+    counts = df.groupby("lap_index").size()
+    assert counts[3] == round(laps.loc[3, "total_elapsed_time"]) == 240
+    joined = df.join(laps.set_index("message_index"), on="lap_index", rsuffix="_lap")
+    reps = joined[joined["lap_index"].isin([3, 5, 7, 9, 11])]
+    assert (reps["avg_speed"] > 4.0).all()  # lap values next to every record of the reps
+
+
 def test_golden_treadmill_columns(fit_file):
     df = sl.read(fit_file("treadmill")).records_df()
     assert not {"position_lat", "step_length", "altitude"} & set(df.columns)
@@ -143,6 +158,26 @@ def test_records_df_fills_speed_from_enhanced_speed():
     assert df["heart_rate"].iloc[2] == 0
     assert df["elapsed_s"].tolist() == [0, 1, 5]
     assert df.index[0] == T0
+
+
+def test_lap_index_boundaries():
+    t = fit_time(T0)
+    w = FitWriter().define(0, 20, [(253, "uint32"), (3, "uint8")])
+    for second in range(6):
+        w.data(0, t + second, 140)
+    # Two laps with message_index 7 and 8: [T0+1, T0+3] and [T0+3, T0+4]
+    w.define(1, 19, [(254, "uint16"), (2, "uint32"), (253, "uint32")])
+    w.data(1, 7, t + 1, t + 3).data(1, 8, t + 3, t + 4)
+    lap_index = sl.read(w.to_bytes()).records_df()["lap_index"]
+    # before the first lap, inside lap 7, on the boundary (the starting lap wins),
+    # on the last lap's end, after every lap
+    assert lap_index.tolist() == [pd.NA, 7, 7, 8, 8, pd.NA]
+    assert str(lap_index.dtype) == "Int64"
+
+
+def test_lap_index_without_laps_is_all_na():
+    lap_index = sl.read(records_file()).records_df()["lap_index"]
+    assert lap_index.isna().all() and len(lap_index) == 3
 
 
 def test_read_accepts_bytes_and_paths(tmp_path):

@@ -2,6 +2,37 @@
 
 Dated experiment log: what was tried → what happened → what was decided. Newest first.
 
+## 2026-10-15: lap_index in records_df()
+
+**Why:** both devscripts (intervals, race) needed to know which lap each record belongs to, and were rebuilding that by hand from lap start times.
+
+**Result:** in all five files, laps tile the timeline. Each lap's `timestamp` (its end) equals the next lap's `start_time`, and the first record falls on the first lap's start. A lap without a pause holds one record per second of its elapsed time.
+
+**Decision:**
+- `records_df()` gets a `lap_index` column (nullable `Int64`) holding the `message_index` of the record's lap. It joins straight onto `laps_df().set_index("message_index")`.
+- **Boundaries:** a lap includes its start second but not its end second, so a boundary record belongs to the lap that is starting. The last lap also includes its own end.
+- **Outside every lap:** a record gets `<NA>` rather than being pushed into the nearest lap. intervals_example has one such record, 1 s after its last lap ends.
+- A file without laps gives an all-`<NA>` column.
+
+## 2026-10-11: Where do Coros lap labels come from? (new_treadmill.fit)
+
+**Tried:** looked for the lap labels Coros shows on its website (Warm Up / Indoor Run / Rest / Cool Down) in new_treadmill.fit, a structured treadmill session (warm-up, 5 × 6:00 work with 1:30 rests, cool-down). Checks:
+- every message type
+- every lap field, including ones our profile doesn't decode
+- developer fields
+- a plain search of the file's bytes for label words
+
+**Result:** the labels are **not in the file**.
+- **Message types:** only the standard ones (0, 18, 19, 20, 21, 23, 34, 206, 207). There is no `workout` (26) or `workout_step` (27).
+- **Lap fields:** the laps have none of the standard fields that would carry a label: `intensity` (23, the FIT vocabulary warmup/active/rest/cooldown), `lap_trigger` (24) or `wkt_step_index` (71).
+- **Other files:** the three older sample files lack these fields too.
+- **Strings:** the only text in the file is the device name and the Stryd field names.
+- **"Indoor Run":** the label on the work laps is just the sport/sub_sport name, so the only real labels are Warm Up, Rest and Cool Down.
+- **Likely source:** Coros most likely keeps the workout steps with its own copy of the activity and leaves them out of the FIT export. This is an inference; it can't be seen from the file.
+- **Laps line up:** the FIT laps match the Coros splits one-to-one, in time and distance.
+
+**Decision:** for Coros files, laps are all we get (this partly answers the open question about `workout_step`). Interval labels have to be derived in the analysis layer, from lap structure and speed, using FIT's `intensity` vocabulary (warmup / active / rest / cooldown). The Coros CSV export (`data/derived/export_new_treadmill.csv`, with `TYPE`) is the ground truth to check that against.
+
 ## 2026-10-10: Slice 01, M2–M6 (profile, dev fields, Activity API, demo, hardening)
 
 **Tried:** profile decoding generated from Garmin's `garmin-fit-sdk` (dev dependency only), cross-checked value by value against the SDK's own decoder on all three files (`tests/test_oracle.py`).
